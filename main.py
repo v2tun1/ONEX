@@ -7264,6 +7264,45 @@ async def security_unlock(request: Request, token=Depends(require_auth)):
     return {"ok": True}
 
 
+@app.get("/api/backup/full")
+async def backup_full(token=Depends(require_auth)):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        if not (meta.get("permissions") or {}).get("settings"):
+            raise HTTPException(403, detail="دسترسی ندارید")
+
+    telegram = {}
+    try:
+        if TG_FILE.exists():
+            telegram = json.loads(TG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        telegram = {}
+
+    payload = {
+        "type": "onex_full_backup",
+        "version": APP_VERSION,
+        "created_at": datetime.now().isoformat(),
+        "panel": {
+            "links": dict(LINKS),
+            "subs": dict(SUBS),
+            "categories": dict(CATEGORIES),
+            "admin_accounts": dict(ADMIN_ACCOUNTS),
+            "username": AUTH.get("username", "admin"),
+            "password_hash": AUTH.get("password_hash", ""),
+            "credentials_version": 1,
+        },
+        "telegram": telegram,
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="ONEX-backup-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
+        },
+    )
+
+
 @app.get("/api/backup/users")
 async def backup_users(token=Depends(require_auth)):
     meta = get_session_meta(token)
@@ -7272,7 +7311,7 @@ async def backup_users(token=Depends(require_auth)):
         if not (meta.get("permissions") or {}).get("settings"):
             raise HTTPException(403, detail="دسترسی ندارید")
     payload = {
-        "type": "pxpanel_users_backup",
+        "type": "onex_users_backup",
         "version": APP_VERSION,
         "created_at": datetime.now().isoformat(),
         "links": dict(LINKS),
@@ -7285,7 +7324,7 @@ async def backup_users(token=Depends(require_auth)):
         content=body,
         media_type="application/json",
         headers={
-            "Content-Disposition": f'attachment; filename="pxpanel-users-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
+            "Content-Disposition": f'attachment; filename="ONEX-users-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
         },
     )
 
@@ -7303,7 +7342,7 @@ async def backup_bot(token=Depends(require_auth)):
     except Exception:
         data = {}
     payload = {
-        "type": "pxpanel_bot_backup",
+        "type": "onex_bot_backup",
         "version": APP_VERSION,
         "created_at": datetime.now().isoformat(),
         "telegram": data,
@@ -7313,9 +7352,109 @@ async def backup_bot(token=Depends(require_auth)):
         content=body,
         media_type="application/json",
         headers={
-            "Content-Disposition": f'attachment; filename="pxpanel-bot-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
+            "Content-Disposition": f'attachment; filename="ONEX-bot-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
         },
     )
+
+
+@app.post("/api/restore/full")
+async def restore_full(request: Request, token=Depends(require_auth)):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        raise HTTPException(403, detail="فقط مالک پنل")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, detail="فایل JSON نامعتبر")
+
+    if not isinstance(body, dict) or body.get("type") != "onex_full_backup":
+        raise HTTPException(400, detail="فایل بک‌آپ کامل ONEX نیست")
+
+    panel = body.get("panel")
+    telegram = body.get("telegram", {})
+    if not isinstance(panel, dict):
+        raise HTTPException(400, detail="بخش پنل در بک‌آپ نامعتبر است")
+    if not isinstance(telegram, dict):
+        raise HTTPException(400, detail="بخش ربات در بک‌آپ نامعتبر است")
+
+    links = panel.get("links")
+    if not isinstance(links, dict):
+        raise HTTPException(400, detail="کانفیگ‌های بک‌آپ نامعتبر است")
+
+    async with LINKS_LOCK:
+        LINKS.clear()
+        SUBS.clear()
+        CATEGORIES.clear()
+        ADMIN_ACCOUNTS.clear()
+
+        LINKS.update(links)
+        if isinstance(panel.get("subs"), dict):
+            SUBS.update(panel["subs"])
+        if isinstance(panel.get("categories"), dict):
+            CATEGORIES.update(panel["categories"])
+        if isinstance(panel.get("admin_accounts"), dict):
+            ADMIN_ACCOUNTS.update(panel["admin_accounts"])
+
+        for uid, link in list(LINKS.items()):
+            if not isinstance(link, dict):
+                LINKS.pop(uid, None)
+                continue
+            link.setdefault("protocol", DEFAULT_PROTOCOL)
+            link.setdefault("fingerprint", DEFAULT_FINGERPRINT)
+            link.setdefault("used_bytes", 0)
+            link.setdefault("active", True)
+            link.setdefault("config_count", 1)
+
+    username = str(panel.get("username") or AUTH.get("username") or "admin").strip().lower()
+    password_hash = str(panel.get("password_hash") or AUTH.get("password_hash") or "").strip()
+    if not password_hash:
+        raise HTTPException(400, detail="اطلاعات ورود در بک‌آپ موجود نیست")
+
+    AUTH["username"] = username
+    AUTH["password_hash"] = password_hash
+    AUTH["credentials_version"] = int(panel.get("credentials_version") or 1)
+
+    await save_state()
+
+    bot_warning = None
+    try:
+        TG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TG_FILE.write_text(
+            json.dumps(telegram, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        from onex.integrations.telegram_bot import configure_bot, start_bot, stop_bot, setup_webhook
+        await stop_bot()
+        configure_bot(telegram.get("token") or "", telegram.get("admin_ids") or "")
+        if telegram.get("token"):
+            host = get_host(request)
+            if telegram.get("webhook") and host and host != "localhost":
+                wh = f"https://{host}/telegram/webhook"
+                await setup_webhook(wh)
+                await start_bot(mode="webhook")
+            else:
+                await setup_webhook("")
+                await start_bot(mode="polling")
+    except Exception as exc:
+        bot_warning = str(exc)
+        logger.warning("full backup bot activation: %s", exc)
+
+    log_activity(
+        "backup",
+        f"بازیابی کامل ONEX انجام شد — {len(LINKS)} کانفیگ",
+        "warn" if bot_warning else "ok",
+    )
+    result = {
+        "ok": True,
+        "links": len(LINKS),
+        "subs": len(SUBS),
+        "mode": "full",
+        "message": "بک‌آپ کامل ONEX بازیابی شد",
+    }
+    if bot_warning:
+        result["warning"] = f"اطلاعات ربات بازیابی شد اما فعال‌سازی ربات خطا داشت: {bot_warning}"
+    return result
 
 
 @app.post("/api/restore/users")
@@ -7331,7 +7470,7 @@ async def restore_users(request: Request, token=Depends(require_auth)):
         raise HTTPException(400, detail="فرمت نامعتبر")
     # accept either wrapper or raw state
     links = body.get("links")
-    if links is None and body.get("type") == "pxpanel_users_backup":
+    if links is None and body.get("type") in ("onex_users_backup", "pxpanel_users_backup"):
         raise HTTPException(400, detail="لینک‌ها در بک‌آپ نیست")
     if links is None:
         raise HTTPException(400, detail="فایل بک‌آپ کاربران نیست")
@@ -9337,24 +9476,34 @@ Cache-Control: no-cache"></textarea></div>
     <button class="btn btn-sm btn-d" onclick="unlockAllIps()">رفع مسدودی همـه ایپــی هــا</button>
   </div>
 <div class="card">
-    <div class="card-title">بــک آپ و بازیابــی</div>
-    <p style="font-size:12px;color:var(--t3);line-height:1.8;margin-bottom:14px">در صورت خرابی پنل، بک‌آپ را دانلود کنید و در پنل جدید وارد کنید.</p>
+    <div class="card-title">بــک آپ و بازیابــی ONEX</div>
+    <p style="font-size:12px;color:var(--t3);line-height:1.8;margin-bottom:14px">یک نسخه پشتیبان از اطلاعات پروژه ONEX تهیه کنید و در صورت نیاز روی پنل جدید بازیابی کنید.</p>
+
     <div class="g2" style="margin-bottom:12px">
-      <button class="btn btn-p" style="width:100%" onclick="downloadBackup('users')">دانلود بک‌آپ کاربران</button>
-      <button class="btn btn-p" style="width:100%;background:linear-gradient(135deg,#8b5cf6,#6366f1)" onclick="downloadBackup('bot')">دانلود بک‌آپ ربات</button>
+      <button class="btn btn-p" style="width:100%" onclick="downloadBackup('full')">دانلود بک‌آپ کامل ONEX</button>
+      <button class="btn btn-p" style="width:100%;background:linear-gradient(135deg,#8b5cf6,#6366f1)" onclick="downloadBackup('users')">دانلود بک‌آپ کاربران</button>
+      <button class="btn btn-p" style="width:100%;background:linear-gradient(135deg,#10b981,#059669)" onclick="downloadBackup('bot')">دانلود بک‌آپ ربات</button>
     </div>
+
     <div class="field">
-      <label>وارد کردن بـک‌آپ کاربران</label>
+      <label>وارد کردن بک‌آپ کامل ONEX</label>
+      <input type="file" id="restoreFullFile" accept="application/json,.json" style="padding:10px">
+      <button class="btn btn-sm btn-d" style="margin-top:8px" onclick="restoreFull()">جایگزینی کامل پروژه</button>
+    </div>
+
+    <div class="field" style="margin-top:12px">
+      <label>وارد کردن بک‌آپ کاربران</label>
       <input type="file" id="restoreUsersFile" accept="application/json,.json" style="padding:10px">
       <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
-        <button class="btn btn-sm" onclick="restoreUsers('merge')">ادغام بــــا فعلـی</button>
-        <button class="btn btn-sm btn-d" onclick="restoreUsers('replace')">جایگزینی کامـل</button>
+        <button class="btn btn-sm" onclick="restoreUsers('merge')">ادغام با فعلی</button>
+        <button class="btn btn-sm btn-d" onclick="restoreUsers('replace')">جایگزینی کامل</button>
       </div>
     </div>
+
     <div class="field" style="margin-top:12px">
-      <label>وارد کردن بــک آپ ربـات</label>
+      <label>وارد کردن بک‌آپ ربات</label>
       <input type="file" id="restoreBotFile" accept="application/json,.json" style="padding:10px">
-      <button class="btn btn-sm" style="margin-top:8px" onclick="restoreBot()">بازیابـی ربـات</button>
+      <button class="btn btn-sm" style="margin-top:8px" onclick="restoreBot()">بازیابی ربات</button>
     </div>
   </div>
 </section>
@@ -11231,7 +11380,7 @@ async function unlockAllIps(){
 
 async function downloadBackup(kind){
   try{
-    const url = kind==='bot' ? '/api/backup/bot' : '/api/backup/users';
+    const url = kind==='full' ? '/api/backup/full' : (kind==='bot' ? '/api/backup/bot' : '/api/backup/users');
     const r = await fetch(url, {credentials:'same-origin', cache:'no-store'});
     if(r.status===401){ location.href='/login'; return; }
     if(!r.ok){
@@ -11240,18 +11389,32 @@ async function downloadBackup(kind){
       toast(String(msg)); return;
     }
     const text = await r.text();
-    // validate json
     try{ JSON.parse(text); }catch(e){ toast('پاسخ نامعتبر'); return; }
     const blob = new Blob([text], {type:'application/json;charset=utf-8'});
     const a = document.createElement('a');
     const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
     a.href = URL.createObjectURL(blob);
-    a.download = kind==='bot' ? ('pxpanel-bot-'+stamp+'.json') : ('pxpanel-users-'+stamp+'.json');
+    a.download = kind==='full' ? ('ONEX-backup-'+stamp+'.json') : (kind==='bot' ? ('ONEX-bot-'+stamp+'.json') : ('ONEX-users-'+stamp+'.json'));
     document.body.appendChild(a);
     a.click();
     setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 500);
     toast(lang==='fa'?'دانلود شد':'Downloaded');
   }catch(e){ toast(String(e.message||e)); }
+}
+async function restoreFull(){
+  try{
+    const data = await readJsonFile('restoreFullFile');
+    if(data.type!=='onex_full_backup'){
+      toast(lang==='fa'?'این فایل بک‌آپ کامل ONEX نیست':'This is not a full ONEX backup');
+      return;
+    }
+    if(!confirm(lang==='fa'?'تمام اطلاعات فعلی پنل و تنظیمات ربات با بک‌آپ جایگزین می‌شود. مطمئنی؟':'All current panel and bot data will be replaced. Continue?')) return;
+    const r = await api('/api/restore/full',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    if(r){
+      toast(r.warning || r.message || (lang==='fa'?'بک‌آپ کامل بازیابی شد':'Full backup restored'));
+      setTimeout(()=>location.reload(), 900);
+    }
+  }catch(e){ toast(e.message||String(e)); }
 }
 function readJsonFile(inputId){
   return new Promise((resolve,reject)=>{
